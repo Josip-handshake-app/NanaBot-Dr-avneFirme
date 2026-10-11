@@ -27,9 +27,7 @@ from xml.etree import ElementTree
 import requests
 from bs4 import BeautifulSoup
 from docx import Document
-from docx.opc.exceptions import PackageNotFoundError
 from pypdf import PdfReader
-from pypdf.errors import PdfReadError, PdfStreamError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -66,6 +64,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 REQUEST_PAUSE_SECONDS = 0.35
+REQUEST_TIMEOUT = (5, 5)
 MAX_DOCUMENT_BYTES = 8_000_000
 
 CITY_TRIGGERS = (
@@ -145,9 +144,11 @@ def make_session() -> requests.Session:
         }
     )
     retry = Retry(
-        total=2,
-        backoff_factor=1,
-        status_forcelist=(403, 429, 500, 502, 503, 504),
+        total=0,
+        connect=0,
+        read=0,
+        status=0,
+        redirect=2,
         allowed_methods=frozenset({"GET"}),
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -168,9 +169,11 @@ def session_with_system_trust(session: requests.Session) -> requests.Session:
     trusted = requests.Session()
     trusted.headers.update(session.headers)
     retry = Retry(
-        total=2,
-        backoff_factor=1,
-        status_forcelist=(403, 429, 500, 502, 503, 504),
+        total=0,
+        connect=0,
+        read=0,
+        status=0,
+        redirect=2,
         allowed_methods=frozenset({"GET"}),
     )
     trusted.mount("https://", SystemTrustAdapter(max_retries=retry))
@@ -178,22 +181,36 @@ def session_with_system_trust(session: requests.Session) -> requests.Session:
     return trusted
 
 
+BLOCKED_URL_RE = re.compile(r"content\.outlook|c:[\\/]users", re.IGNORECASE)
+
+
+def is_admin_path(url: str) -> bool:
+    return BLOCKED_URL_RE.search(url) is not None
+
+
 def resolve_url(base: str, href: str) -> str | None:
     raw = href.strip()
     lowered = raw.lower()
     if not raw or lowered.startswith(("javascript:", "mailto:", "file:")):
         return None
-    if re.match(r"^[a-zA-Z]:[\\/]", raw):
+    if is_admin_path(raw) or re.match(r"^[a-zA-Z]:[\\/]", raw):
         return None
     joined = urljoin(base, raw)
-    if re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", joined):
+    if is_admin_path(joined) or re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", joined):
         return None
     return joined
 
 
 def fetch(session: requests.Session, url: str) -> requests.Response:
-    response = session.get(url, timeout=30)
-    response.raise_for_status()
+    if is_admin_path(url):
+        logger.warning("Skipping administrative link: %s", url[:160])
+        raise requests.RequestException("administrative link")
+    try:
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Skipping slow or failed link: %s (%s)", url[:160], type(exc).__name__)
+        raise
     if "html" in response.headers.get("Content-Type", "") or not response.encoding:
         response.encoding = response.apparent_encoding or "utf-8"
     time.sleep(REQUEST_PAUSE_SECONDS)
@@ -388,10 +405,11 @@ def pdf_text(payload: bytes) -> str:
         for page in reader.pages[:20]:
             try:
                 pages.append(page.extract_text() or "")
-            except (PdfStreamError, PdfReadError) as exc:
+            except Exception as exc:
                 logger.warning("Skipping unreadable PDF page: %s", exc)
+                continue
         return "\n".join(pages)
-    except (PdfStreamError, PdfReadError) as exc:
+    except Exception as exc:
         logger.warning("Skipping corrupted PDF: %s", exc)
         return ""
 
@@ -399,15 +417,15 @@ def pdf_text(payload: bytes) -> str:
 def docx_text(payload: bytes) -> str:
     try:
         document = Document(BytesIO(payload))
-    except (PackageNotFoundError, zipfile.BadZipFile, ValueError) as exc:
+        parts = [paragraph.text for paragraph in document.paragraphs]
+        for table in document.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    parts.append(cell.text)
+        return "\n".join(part for part in parts if part.strip())
+    except Exception as exc:
         logger.warning("Skipping unreadable Word file: %s", exc)
         return ""
-    parts = [paragraph.text for paragraph in document.paragraphs]
-    for table in document.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                parts.append(cell.text)
-    return "\n".join(part for part in parts if part.strip())
 
 
 def is_downloadable_document(url: str) -> bool:
@@ -429,18 +447,22 @@ def document_text(session: requests.Session, url: str, cache: dict[str, str]) ->
         raise ValueError(f"document is larger than {MAX_DOCUMENT_BYTES} bytes")
     content_type = response.headers.get("Content-Type", "").lower()
     path = url.lower().split("?", 1)[0]
-    if path.endswith(".pdf") or "pdf" in content_type:
-        text = pdf_text(payload)
-    elif path.endswith(".docx") or "wordprocessingml" in content_type:
-        text = docx_text(payload)
-    else:
-        parsed = BeautifulSoup(payload, "html.parser")
-        for tag in parsed(["script", "style", "noscript"]):
-            tag.decompose()
-        main = parsed.select_one(
-            "article, main, .entry-content, .post-content, .opis, .page-content"
-        )
-        text = (main or parsed).get_text("\n", strip=True)
+    try:
+        if path.endswith(".pdf") or "pdf" in content_type:
+            text = pdf_text(payload)
+        elif path.endswith((".docx", ".doc")) or "wordprocessingml" in content_type or "msword" in content_type:
+            text = docx_text(payload)
+        else:
+            parsed = BeautifulSoup(payload, "html.parser")
+            for tag in parsed(["script", "style", "noscript"]):
+                tag.decompose()
+            main = parsed.select_one(
+                "article, main, .entry-content, .post-content, .opis, .page-content"
+            )
+            text = (main or parsed).get_text("\n", strip=True)
+    except Exception as exc:
+        logger.warning("Skipping unreadable document %s (%s)", url[:160], exc)
+        text = ""
     cache[url] = text
     return text
 
@@ -488,11 +510,13 @@ def collect_city(session: requests.Session, today: date) -> list[Job]:
             continue
         office = link.get_text(" ", strip=True)
         notice_url = urljoin(CITY_LIST_URL, link["href"])
+        if is_admin_path(link["href"]) or is_admin_path(notice_url):
+            logger.warning("Skipping administrative link: %s", str(link["href"])[:160])
+            continue
         published = parse_dmy(item.get_text(" ", strip=True))
         try:
             notice = soup_of(session, notice_url)
         except requests.RequestException:
-            logger.exception("City notice failed: %s", notice_url)
             continue
         body = notice.select_one("div.opis")
         if body is None:
@@ -565,6 +589,10 @@ def collect_culture(session: requests.Session, today: date) -> list[Job]:
     links = body.find_all("a", href=True)
     logger.info("Culture list has %s links", len(links))
     for link in links:
+        href = str(link.get("href") or "")
+        if is_admin_path(href):
+            logger.warning("Skipping administrative link: %s", href[:160])
+            continue
         label = collapse(link.get_text(" ", strip=True))
         if not any(trigger in label.lower() for trigger in CULTURE_TRIGGERS):
             continue
@@ -587,11 +615,10 @@ def collect_culture(session: requests.Session, today: date) -> list[Job]:
         published = parse_dmy(tail) or parse_croatian_date(tail)
         try:
             document = document_text(session, document_url, cache)
-        except requests.RequestException as exc:
-            logger.warning("Could not read culture document %s (%s)", document_url, exc)
+        except requests.RequestException:
             continue
         except (ValueError, zipfile.BadZipFile, OSError, ElementTree.ParseError) as exc:
-            logger.warning("Could not parse culture document %s (%s)", document_url, exc)
+            logger.warning("Skipping unreadable culture document %s (%s)", document_url[:160], exc)
             continue
         if not is_sss(document):
             continue
@@ -625,6 +652,9 @@ def collect_kindergartens(session: requests.Session, today: date) -> list[Job]:
         href = card.get("href")
         if not href:
             continue
+        if is_admin_path(str(href)):
+            logger.warning("Skipping administrative link: %s", str(href)[:160])
+            continue
         office = ""
         date_node = card.select_one(".date")
         title_node = card.select_one("h4")
@@ -635,7 +665,6 @@ def collect_kindergartens(session: requests.Session, today: date) -> list[Job]:
         try:
             detail = soup_of(session, detail_url)
         except requests.RequestException:
-            logger.exception("Kindergarten detail failed: %s", detail_url)
             continue
         content = detail.select_one(".page-content")
         if content is None:
@@ -645,16 +674,18 @@ def collect_kindergartens(session: requests.Session, today: date) -> list[Job]:
         documents = []
         for anchor in content.find_all("a", href=True):
             document_url = resolve_url(detail_url, anchor["href"]) or ""
+            if is_admin_path(anchor["href"]) or is_admin_path(document_url):
+                logger.warning("Skipping administrative link: %s", anchor["href"][:160])
+                continue
             if is_downloadable_document(document_url):
                 documents.append(document_url)
         combined = detail_text
         for document_url in documents:
             try:
                 combined += "\n" + document_text(session, document_url, cache)
-            except (requests.RequestException, ValueError, zipfile.BadZipFile, OSError):
-                logger.warning("Skipping unreadable kindergarten file %s", document_url)
-            except Exception:
-                logger.exception("Skipping kindergarten file %s", document_url)
+            except Exception as exc:
+                logger.warning("Skipping unreadable kindergarten file %s (%s)", document_url, exc)
+                continue
         if not is_sss(combined):
             continue
         deadline, deadline_date = describe_deadline(detail_text, None)
@@ -693,7 +724,7 @@ def collect_selekcija(session: requests.Session, today: date) -> list[Job]:
                 "top": str(page_size),
                 "skip": str(skip),
             },
-            timeout=40,
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         records = response.json().get("Records") or []
@@ -773,6 +804,10 @@ def location_is_zagreb(location: str) -> bool:
 def attachment_urls(page: BeautifulSoup, page_url: str) -> list[str]:
     found: list[str] = []
     for link in page.find_all("a", href=True):
+        raw_href = str(link.get("href") or "")
+        if is_admin_path(raw_href):
+            logger.warning("Skipping administrative link: %s", raw_href[:160])
+            continue
         label = link.get_text(" ", strip=True)
         if SKIP_ATTACHMENT_RE.search(label) or title_is_closed(label):
             continue
@@ -1353,7 +1388,7 @@ def send_email(jobs: list[Job], env: dict[str, str], today: date) -> None:
             "html": html_body,
             "text": text_body,
         },
-        timeout=30,
+        timeout=REQUEST_TIMEOUT,
     )
     if response.status_code >= 400:
         logger.error("Resend rejected the email: %s %s", response.status_code, response.text)
