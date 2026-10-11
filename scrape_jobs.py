@@ -1044,7 +1044,11 @@ def collect_hzinfra(session: requests.Session, today: date) -> list[Job]:
     except requests.exceptions.SSLError:
         logger.warning("HŽ Infrastruktura certificate was not in the default bundle; using the system store")
         session = session_with_system_trust(session)
-        page = soup_of(session, HZINFRA_LIST_URL)
+        try:
+            page = soup_of(session, HZINFRA_LIST_URL)
+        except requests.exceptions.SSLError:
+            logger.warning("Skipping HŽ Infrastruktura: certificate could not be verified")
+            return []
     jobs: list[Job] = []
     for article in page.select("article"):
         link = article.select_one("h2 a[href]")
