@@ -34,6 +34,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Use the latest sent job ids
+        run: |
+          git fetch origin main
+          git checkout origin/main -- sent_jobs.json
+
       - name: Scrape and send
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -45,11 +50,34 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp sent_jobs.json "$RUNNER_TEMP/sent_jobs.new.json"
+          git fetch origin main
+          git reset --hard origin/main
+          python - << 'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def load_ids(path: Path) -> set[str]:
+              if not path.exists():
+                  return set()
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              if isinstance(payload, list):
+                  return {str(item) for item in payload}
+              return {str(item) for item in payload.get("ids", [])}
+
+          current = Path("sent_jobs.json")
+          fresh = Path(os.environ["RUNNER_TEMP"]) / "sent_jobs.new.json"
+          ids = sorted(load_ids(current) | load_ids(fresh))
+          current.write_text(
+              json.dumps({"ids": ids}, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
           git add sent_jobs.json
           if git diff --cached --quiet; then
             echo "No changes to sent_jobs.json"
             exit 0
           fi
           git commit -m "Update sent job ids"
-          git pull --rebase origin main
           git push
